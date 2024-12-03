@@ -13,5 +13,11 @@
     "idf.port": "/dev/tty.wchusbserial58FC0580111",
     "idf.pythonBinPath": "/Users/sax/.espressif/python_env/idf5.3_py3.12_env/bin/python",
     "idf.toolsPath": "/Users/sax/.espressif",
-    "idf.flashType": "UART"
+    "idf.flashType": "UART",
+    "git.ignoreLimitWarning": true,
+    "conventionalCommits.scopes": [
+        "key_switch",
+        "led",
+        "ble",
+    ]
 }

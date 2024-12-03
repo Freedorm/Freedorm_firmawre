@@ -28,6 +28,9 @@
 #include "driver/gpio.h"
 #include "hid_dev.h"
 
+#include "esp_task_wdt.h"
+#include "multi_button.h"
+
 /**
  * Brief:
  * This example Implemented BLE HID device profile related functions, in which the HID device
@@ -87,6 +90,10 @@ static uint8_t hidd_service_uuid128[] = {
     0x00,
 };
 
+#define BUTTON1_ID 0
+
+struct Button btn1;
+
 static esp_ble_adv_data_t hidd_adv_data = {
     .set_scan_rsp = false,
     .include_name = true,
@@ -114,36 +121,153 @@ static esp_ble_adv_params_t hidd_adv_params = {
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
 
-// 自定义 GATT 服务事件处理
-static void gatt_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
+#define MAX_WHITELIST_SIZE 10
+typedef struct
 {
-    switch (event)
+    uint8_t num_devices;
+    esp_bd_addr_t devices[MAX_WHITELIST_SIZE];
+} whitelist_t;
+
+static whitelist_t whitelist;
+static bool pairing_mode = false;
+static esp_bd_addr_t connected_bd_addr;
+static SemaphoreHandle_t pairing_semaphore;
+
+#define PAIRING_BUTTON_GPIO GPIO_NUM_0 // 修改为您的按键GPIO编号
+#define OUTPUT_LED GPIO_NUM_12
+
+static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param);
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
+static void pairing_mode_task(void *arg);
+
+void flip_led(int gpio_num)
+{
+    // verify the gpio is in the gpio_num_t
+    if (gpio_num < GPIO_NUM_0 || gpio_num >= GPIO_NUM_MAX)
     {
-    case ESP_GATTS_REG_EVT:
-        ESP_LOGI(GATT_TAG, "ESP_GATTS_REG_EVT, app_id %d", param->reg.app_id);
-        esp_ble_gatts_create_service(gatts_if, &(esp_gatt_srvc_id_t){.is_primary = true, .id.inst_id = 0, .id.uuid.len = ESP_UUID_LEN_16, .id.uuid.uuid.uuid16 = GATTS_SERVICE_UUID}, GATTS_NUM_HANDLE);
-        break;
+        ESP_LOGE(HID_DEMO_TAG, "Invalid GPIO number");
+        return;
+    }
 
-    case ESP_GATTS_CREATE_EVT:
-        ESP_LOGI(GATT_TAG, "ESP_GATTS_CREATE_EVT, status %d", param->create.status);
-        gatt_handle_table[0] = param->create.service_handle;
-        esp_ble_gatts_start_service(gatt_handle_table[0]);
-        esp_ble_gatts_add_char(gatt_handle_table[0], &(esp_bt_uuid_t){.len = ESP_UUID_LEN_16, .uuid.uuid16 = GATTS_CHAR_UUID}, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
-                               ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE, NULL, NULL);
-        break;
+    ESP_LOGI("LED_FLIP", "Toggling GPIO %d", gpio_num);
+    ESP_LOGI("LED_FLIP", "Current GPIO %d level: %d", gpio_num, gpio_get_level(gpio_num));
 
-    case ESP_GATTS_WRITE_EVT:
-        ESP_LOGI(GATT_TAG, "ESP_GATTS_WRITE_EVT, handle = %d", param->write.handle);
-        if (param->write.handle == gatt_handle_table[1])
+    gpio_get_level(gpio_num) ? gpio_set_level(gpio_num, 0) : gpio_set_level(gpio_num, 1);
+
+    ESP_LOGI("LED_FLIP", "New GPIO %d level: %d", gpio_num, gpio_get_level(gpio_num));
+}
+
+uint8_t read_button_GPIO(uint8_t button_id)
+{
+    // ESP_LOGI(HID_DEMO_TAG, "Reading GPIO %d ,LEVEL: %d", PAIRING_BUTTON_GPIO, gpio_get_level(PAIRING_BUTTON_GPIO));
+    return gpio_get_level(PAIRING_BUTTON_GPIO);
+}
+
+void button_task(void *arg)
+{
+    while (1)
+    {
+        button_ticks();                // 按键状态检测
+        vTaskDelay(pdMS_TO_TICKS(10)); // 每 5 毫秒调用一次
+    }
+}
+
+void BTN1_SINGLE_CLICK_Handler(void *btn)
+{
+    ESP_LOGI(HID_DEMO_TAG, "Single click detected");
+    flip_led(OUTPUT_LED); // 翻转 LED 状态
+    // 进入配对模式
+}
+
+void BTN1_LONG_PRESS_HOLD_Handler(void *btn)
+{
+    ESP_LOGI(HID_DEMO_TAG, "Long press hold detected");
+    // pairing_mode = true;
+    // xSemaphoreGive(pairing_semaphore);
+    // 长按启动后的逻辑
+}
+
+/* 加载白名单 */
+esp_err_t load_whitelist_from_nvs(whitelist_t *list)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("storage", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK)
+        return err;
+
+    size_t required_size = sizeof(whitelist_t);
+    err = nvs_get_blob(nvs_handle, "whitelist", list, &required_size);
+    nvs_close(nvs_handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        // 白名单不存在，初始化
+        list->num_devices = 0;
+        memset(list->devices, 0, sizeof(list->devices));
+        return ESP_OK;
+    }
+    return err;
+}
+
+/* 保存白名单 */
+esp_err_t save_whitelist_to_nvs(whitelist_t *list)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+        return err;
+
+    err = nvs_set_blob(nvs_handle, "whitelist", list, sizeof(whitelist_t));
+    if (err != ESP_OK)
+    {
+        nvs_close(nvs_handle);
+        return err;
+    }
+    err = nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+    return err;
+}
+
+esp_err_t delete_whitelist_from_nvs()
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+        return err;
+
+    err = nvs_erase_key(nvs_handle, "whitelist");
+    if (err != ESP_OK)
+    {
+        nvs_close(nvs_handle);
+        return err;
+    }
+    err = nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+    return err;
+}
+/* 配对模式任务 */
+void pairing_mode_task(void *arg)
+{
+    while (1)
+    {
+        if (xSemaphoreTake(pairing_semaphore, portMAX_DELAY) == pdTRUE)
         {
-            memset(gatt_char_value, 0, sizeof(gatt_char_value));
-            memcpy(gatt_char_value, param->write.value, param->write.len);
-            ESP_LOGI(GATT_TAG, "GATT Write: %s", gatt_char_value);
+            // 进入配对模式
+            pairing_mode = true;
+            ESP_LOGI(HID_DEMO_TAG, "Entering pairing mode");
+            // 设置广播参数，允许所有设备连接
+            hidd_adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+            esp_ble_gap_stop_advertising();
+            esp_ble_gap_start_advertising(&hidd_adv_params);
+            // 配对模式持续60秒
+            vTaskDelay(6000 / portTICK_PERIOD_MS);
+            // 退出配对模式
+            pairing_mode = false;
+            ESP_LOGI(HID_DEMO_TAG, "Exiting pairing mode");
+            // 设置广播参数，只允许白名单设备连接
+            hidd_adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_WLST_CON_WLST;
+            esp_ble_gap_stop_advertising();
+            esp_ble_gap_start_advertising(&hidd_adv_params);
         }
-        break;
-
-    default:
-        break;
     }
 }
 
@@ -155,7 +279,6 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
     {
         if (param->init_finish.state == ESP_HIDD_INIT_OK)
         {
-            // esp_bd_addr_t rand_addr = {0x04,0x11,0x11,0x11,0x11,0x05};
             esp_ble_gap_set_device_name(HIDD_DEVICE_NAME);
             esp_ble_gap_config_adv_data(&hidd_adv_data);
         }
@@ -224,11 +347,45 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         ESP_LOGI(HID_DEMO_TAG, "pair status = %s", param->ble_security.auth_cmpl.success ? "success" : "fail");
         if (param->ble_security.auth_cmpl.success)
         {
+            memcpy(connected_bd_addr, param->ble_security.auth_cmpl.bd_addr, sizeof(esp_bd_addr_t)); // 保存连接设备地址
+            // 检查设备是否已在白名单中
+            bool device_in_whitelist = false;
+            for (int i = 0; i < whitelist.num_devices; i++)
+            {
+                if (memcmp(whitelist.devices[i], connected_bd_addr, sizeof(esp_bd_addr_t)) == 0)
+                {
+                    device_in_whitelist = true;
+                    break;
+                }
+            }
+            if (!device_in_whitelist)
+            {
+                if (whitelist.num_devices < MAX_WHITELIST_SIZE)
+                {
+                    memcpy(whitelist.devices[whitelist.num_devices], connected_bd_addr, sizeof(esp_bd_addr_t));
+                    whitelist.num_devices++;
+                    save_whitelist_to_nvs(&whitelist);
+                    // 添加设备到控制器的白名单
+                    esp_ble_gap_update_whitelist(true, connected_bd_addr, BLE_WL_ADDR_TYPE_PUBLIC);
+                    ESP_LOGI(HID_DEMO_TAG, "Device added to whitelist");
+                }
+                else
+                {
+                    ESP_LOGW(HID_DEMO_TAG, "Whitelist is full");
+                }
+            }
+            // 如果不在配对模式，修改广播参数为只允许白名单设备
+            if (!pairing_mode)
+            {
+                hidd_adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_WLST_CON_WLST;
+                esp_ble_gap_stop_advertising();
+                esp_ble_gap_start_advertising(&hidd_adv_params);
+            }
             esp_ble_gap_read_rssi(connected_bd_addr); // 读取 RSSI 值
         }
         else
         {
-            ESP_LOGE(HID_DEMO_TAG, "fail reason = 0x%x", param->ble_security.auth_cmpl.fail_reason);
+            ESP_LOGE(HID_DEMO_TAG, "Authentication failed, reason: 0x%x", param->ble_security.auth_cmpl.fail_reason);
         }
         break;
 
@@ -236,6 +393,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         if (param->read_rssi_cmpl.status == ESP_BT_STATUS_SUCCESS)
         {
             ESP_LOGI(HID_DEMO_TAG, "RSSI for connected device: %d", param->read_rssi_cmpl.rssi);
+            // 在此根据 RSSI 值执行开门操作
         }
         else
         {
@@ -292,6 +450,27 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    // 加载白名单
+    if (load_whitelist_from_nvs(&whitelist) == ESP_OK)
+    {
+        ESP_LOGI(HID_DEMO_TAG, "Whitelist loaded, num_devices: %d", whitelist.num_devices);
+        for (int i = 0; i < whitelist.num_devices; i++)
+        {
+            esp_ble_gap_update_whitelist(true, whitelist.devices[i], BLE_WL_ADDR_TYPE_PUBLIC);
+            ESP_LOGI(HID_DEMO_TAG, "Device %d: %08x%04x", i, (whitelist.devices[i][0] << 24) + (whitelist.devices[i][1] << 16) + (whitelist.devices[i][2] << 8) + whitelist.devices[i][3], (whitelist.devices[i][4] << 8) + whitelist.devices[i][5]);
+        }
+    }
+
+    // 设置广播参数
+    if (whitelist.num_devices == 0)
+    {
+        hidd_adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+    }
+    else
+    {
+        hidd_adv_params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_WLST_CON_WLST;
+    }
+
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
@@ -328,16 +507,11 @@ void app_main(void)
         ESP_LOGE(HID_DEMO_TAG, "%s init bluedroid failed", __func__);
     }
 
-    if ((ret = esp_ble_gatts_app_register(0)) != ESP_OK)
-    {
-        ESP_LOGE(HID_DEMO_TAG, "%s init bluedroid failed", __func__);
-    }
-    /// register the callback function to the gap module
+    // 注册回调函数
     esp_ble_gap_register_callback(gap_event_handler);
     esp_hidd_register_callbacks(hidd_event_callback);
-    esp_ble_gatts_register_callback(gatt_event_handler);
 
-    /* set the security iocap & auth_req & key size & init key response key parameters to the stack*/
+    /* 设置安全参数 */
     esp_ble_auth_req_t auth_req = ESP_LE_AUTH_BOND; // bonding with peer device after authentication
     esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;       // set the IO capability to No output No input
     uint8_t key_size = 16;                          // the key size should be 7~16 bytes
@@ -346,12 +520,38 @@ void app_main(void)
     esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(uint8_t));
     esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(uint8_t));
     esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(uint8_t));
-    /* If your BLE device act as a Slave, the init_key means you hope which types of key of the master should distribute to you,
-    and the response key means which key you can distribute to the Master;
-    If your BLE device act as a master, the response key means you hope which types of key of the slave should distribute to you,
-    and the init key means which key you can distribute to the slave. */
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(uint8_t));
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(uint8_t));
 
-    xTaskCreate(&hid_demo_task, "hid_task", 2048, NULL, 5, NULL);
+    // 按键初始化
+    gpio_config_t input_io_conf = {};
+    input_io_conf.intr_type = GPIO_INTR_POSEDGE;
+    input_io_conf.mode = GPIO_MODE_INPUT;
+    input_io_conf.pin_bit_mask = (1ULL << PAIRING_BUTTON_GPIO);
+    input_io_conf.pull_up_en = 1;
+    gpio_config(&input_io_conf);
+
+    // 当按下GPIO0时，使GPIO IO12 的 LED亮起
+    gpio_config_t output_io_conf = {
+        .pin_bit_mask = (1ULL << OUTPUT_LED),  // 配置 GPIO2 为输出
+        .mode = GPIO_MODE_OUTPUT,              // 输出模式
+        .pull_up_en = GPIO_PULLUP_DISABLE,     // 不需要上拉
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, // 不需要下拉
+        .intr_type = GPIO_INTR_DISABLE         // 不需要中断
+    };
+    gpio_config(&output_io_conf);
+
+    // 初始化按键对象
+    button_init(&btn1, read_button_GPIO, 1, 0); // 第三个参数为有效电平 0（低电平有效），第四个参数为按键 ID 艹，tmd debug半天结果是这里参考电平的问题，艹
+
+    button_attach(&btn1, SINGLE_CLICK, BTN1_SINGLE_CLICK_Handler);
+    button_attach(&btn1, LONG_PRESS_START, BTN1_LONG_PRESS_HOLD_Handler);
+    button_start(&btn1);
+
+    xTaskCreate(&button_task, "button_task", 2048, NULL, 6, NULL);
+
+    pairing_semaphore = xSemaphoreCreateBinary();
+    xTaskCreate(&pairing_mode_task, "pairing_mode_task", 2048, NULL, 5, NULL);
+
+    // xTaskCreate(&hid_demo_task, "hid_task", 2048, NULL, 5, NULL);
 }
